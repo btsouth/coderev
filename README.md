@@ -3,7 +3,8 @@
 Self-hosted pull request review. Runs a cheap model over the diff, then puts
 every finding to a panel of independent skeptics and posts only what survives.
 
-Zero runtime dependencies. Node 24, the `gh` CLI, and an API key.
+Zero runtime dependencies. Node 24, an API key, and either the `gh` CLI (GitHub)
+or a token for your Gitea or Forgejo server.
 
 ## Status
 
@@ -69,12 +70,26 @@ Start it advisory (`continue-on-error: true`). A red X on a model's opinion
 trains people to ignore the whole check. Promote it to required only once its
 precision has earned that.
 
-### GitHub only
+### Gitea and Forgejo
 
-CodeRev reads the diff and posts its comment through the `gh` CLI, so it
-reviews GitHub pull requests only. A self-hosted runner works, Gitea's
-included, as long as the pull request lives on GitHub and the runner has `gh`.
-Gitea and Forgejo pull requests are not supported yet.
+The same workflow works on Gitea and Forgejo Actions, saved under
+`.gitea/workflows/` or `.forgejo/workflows/`. CodeRev sees the runner's
+`GITEA_ACTIONS` or `FORGEJO_ACTIONS` variable and talks to the server's REST
+API directly, so the runner image needs no `gh`. The job's automatic token is
+enough to read the PR and post the comment.
+
+If the instance's default actions URL is not GitHub, use the full form:
+`uses: https://github.com/btsouth/coderev@v1`.
+
+To run it against a Gitea PR from your own machine:
+
+```bash
+export CODEREV_FORGE=gitea CODEREV_GITEA_URL=https://git.example.com GITEA_TOKEN=...
+node bin/review-pr.ts --pr 12 --repo ../some-repo
+```
+
+The repository comes from `CODEREV_REPOSITORY=owner/repo`, or else the
+checkout's `origin` remote. `CODEREV_FORGE=github` forces the GitHub path.
 
 ## Usage locally
 
