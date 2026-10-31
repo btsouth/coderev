@@ -36,7 +36,7 @@ inputs:
     required: false
     default: "true"
   github-token:
-    description: Token used for reading the diff and posting the comment.
+    description: Token used for reading the diff and posting the comment. On Gitea and Forgejo this is the job token too.
     required: false
     default: ${{ github.token }}
   find2-provider:

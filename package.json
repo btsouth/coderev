@@ -1,6 +1,6 @@
 {
   "name": "@btsouth/coderev",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": false,
   "description": "CodeRev: self-hosted pull request review that runs a cheap model behind a refutation panel.",
   "type": "module",
