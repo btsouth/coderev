@@ -1,6 +1,6 @@
 name: CodeRev
 description: Self-hosted PR review that runs a cheap model behind a refutation panel.
-author: tsouth89
+author: btsouth
 
 inputs:
   pr:
@@ -119,13 +119,29 @@ runs:
         REVIEW_REFUTE_EXEC_COMMAND: ${{ inputs.refute-exec-command }}
         LINEAR_API_KEY: ${{ inputs.linear-api-key }}
         LINEAR_TEAM_ID: ${{ inputs.linear-team-id }}
+        # Inputs reach the script through the environment, never by template
+        # substitution into the script body, so no input value can become shell.
+        INPUT_PR: ${{ inputs.pr }}
+        INPUT_POST: ${{ inputs.post }}
+        INPUT_GATE: ${{ inputs.gate }}
+        INPUT_CONVENTIONS: ${{ inputs.conventions }}
+        INPUT_LINEAR_FOLLOW_UPS: ${{ inputs.linear-follow-ups }}
+        ACTION_PATH: ${{ github.action_path }}
       run: |
-        args=(--pr "${{ inputs.pr }}")
-        if [[ "${REVIEW_PROVIDER,,}" == "exec" && "$REVIEW_EXEC_COMMAND" == "grok" ]]; then
-          export REVIEW_EXEC_COMMAND="C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${{ github.action_path }}\\bin\\grok-stdin.ps1\""
+        if [[ ! "$INPUT_PR" =~ ^[0-9]+$ ]]; then
+          echo "::error::CodeRev needs a pull request number; got '${INPUT_PR}'. Run it on pull_request events or pass pr." >&2
+          exit 2
         fi
-        [[ "${{ inputs.post }}" == "true" ]] && args+=(--post)
-        [[ -n "${{ inputs.gate }}" ]] && args+=(--gate "${{ inputs.gate }}")
-        [[ -n "${{ inputs.conventions }}" ]] && args+=(--conventions "${{ inputs.conventions }}")
-        [[ "${{ inputs.linear-follow-ups }}" == "true" ]] && args+=(--linear-follow-ups)
-        node "${{ github.action_path }}/bin/review-pr.ts" "${args[@]}"
+        args=(--pr "$INPUT_PR")
+        if [[ "${REVIEW_PROVIDER,,}" == "exec" && "$REVIEW_EXEC_COMMAND" == "grok" ]]; then
+          if [[ "${RUNNER_OS:-}" != "Windows" ]]; then
+            echo "::error::The grok shorthand uses a Windows PowerShell wrapper and only runs on Windows runners. Pass a full exec-command instead." >&2
+            exit 2
+          fi
+          export REVIEW_EXEC_COMMAND="C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${ACTION_PATH}\\bin\\grok-stdin.ps1\""
+        fi
+        [[ "$INPUT_POST" == "true" ]] && args+=(--post)
+        [[ -n "$INPUT_GATE" ]] && args+=(--gate "$INPUT_GATE")
+        [[ -n "$INPUT_CONVENTIONS" ]] && args+=(--conventions "$INPUT_CONVENTIONS")
+        [[ "$INPUT_LINEAR_FOLLOW_UPS" == "true" ]] && args+=(--linear-follow-ups)
+        node "${ACTION_PATH}/bin/review-pr.ts" "${args[@]}"

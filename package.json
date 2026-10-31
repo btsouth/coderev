@@ -1,12 +1,12 @@
 {
-  "name": "@tsouth89/coderev",
-  "version": "0.1.0",
+  "name": "@btsouth/coderev",
+  "version": "1.0.0",
   "private": false,
   "description": "CodeRev: self-hosted pull request review that runs a cheap model behind a refutation panel.",
   "type": "module",
   "license": "MIT",
   "engines": {
-    "node": ">=22.6"
+    "node": ">=24"
   },
   "bin": {
     "coderev": "./bin/review-pr.ts",
