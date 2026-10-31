@@ -6,9 +6,14 @@
  * `GH_TOKEN` or a local login, and is present on every GitHub-hosted runner.
  * Reimplementing that to save one dependency that is already installed would be
  * a poor trade.
+ *
+ * Every export routes to gitea.ts instead when the run targets a Gitea or
+ * Forgejo server, so callers never need to know which forge they are on.
  */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+
+import * as gitea from "./gitea.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -39,6 +44,8 @@ async function gh(args: ReadonlyArray<string>, cwd?: string): Promise<string> {
 }
 
 export function fetchPullRequestDiff(pr: string, cwd?: string): Promise<string> {
+  const forge = gitea.giteaConfig();
+  if (forge !== null) return gitea.fetchPullRequestDiff(forge, pr, cwd);
   return gh(["pr", "diff", pr], cwd);
 }
 
@@ -49,6 +56,8 @@ export interface PullRequestFiles {
 
 /** The head SHA and changed-file paths of a pull request. */
 export async function fetchPullRequestFiles(pr: string, cwd?: string): Promise<PullRequestFiles> {
+  const forge = gitea.giteaConfig();
+  if (forge !== null) return gitea.fetchPullRequestFiles(forge, pr, cwd);
   const raw = await gh(["pr", "view", pr, "--json", "headRefOid,files"], cwd);
   const parsed: unknown = JSON.parse(raw);
   if (typeof parsed !== "object" || parsed === null) throw new GhError("pr", "unexpected shape");
@@ -76,6 +85,8 @@ export async function fetchFileAtRef(
   ref: string,
   cwd?: string,
 ): Promise<string | null> {
+  const forge = gitea.giteaConfig();
+  if (forge !== null) return gitea.fetchFileAtRef(forge, path, ref, cwd);
   const encoded = path.split("/").map(encodeURIComponent).join("/");
   try {
     return await gh(
@@ -118,6 +129,8 @@ export async function createInlinePullRequestReview(input: {
   readonly comments: ReadonlyArray<{ readonly path: string; readonly line: number; readonly body: string }>;
   readonly cwd?: string;
 }): Promise<void> {
+  const forge = gitea.giteaConfig();
+  if (forge !== null) return gitea.createInlinePullRequestReview(forge, input);
   const number = await resolvePullRequestNumber(input.pr, input.cwd);
   const payload = JSON.stringify({
     event: "COMMENT",
@@ -149,6 +162,8 @@ export async function fetchExistingReviewComment(input: {
   readonly marker: string;
   readonly cwd?: string;
 }): Promise<string | null> {
+  const forge = gitea.giteaConfig();
+  if (forge !== null) return gitea.fetchExistingReviewComment(forge, input);
   try {
     const number = await resolvePullRequestNumber(input.pr, input.cwd);
     const body = await gh(
@@ -185,6 +200,8 @@ export async function upsertPullRequestComment(input: {
   readonly body: string;
   readonly cwd?: string;
 }): Promise<"created" | "updated"> {
+  const forge = gitea.giteaConfig();
+  if (forge !== null) return gitea.upsertPullRequestComment(forge, input);
   const number = await resolvePullRequestNumber(input.pr, input.cwd);
   // Server-side filter: only matching comment ids come back, not every body.
   const existing = await gh(
