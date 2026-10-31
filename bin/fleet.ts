@@ -23,7 +23,7 @@ import { promisify } from "node:util";
 const run = promisify(execFile);
 
 const REPOS = ["ceiling", "toolport", "cubby-clipboard", "matteshot"] as const;
-const OWNER = "tsouth89";
+const OWNER = process.env.CODEREV_FLEET_OWNER ?? "btsouth";
 const STALE_MINUTES = 25;
 
 const DIM = "[2m";

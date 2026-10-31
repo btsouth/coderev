@@ -5,6 +5,14 @@ every finding to a panel of independent skeptics and posts only what survives.
 
 Zero runtime dependencies. Node 24, the `gh` CLI, and an API key.
 
+## Status
+
+A personal tool, published because it works and might be useful to someone
+else. It runs on my own repos, gets fixes when something breaks there, and
+issues and PRs are welcome, but there is no support promise. Pin a release tag
+or a commit SHA rather than `main`, so an update never reaches your CI before
+you choose it.
+
 ## Why the panel
 
 Cheap models generate plausible-and-wrong findings freely. A reviewer that
@@ -48,15 +56,25 @@ jobs:
     if: github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@v6
-      - uses: tsouth89/coderev@v1
+      - uses: btsouth/coderev@v1
         with:
           api-key: ${{ secrets.REVIEW_API_KEY }}
           conventions: AGENTS.md
 ```
 
+`@v1` follows the latest 1.x release. For a fixed version pin `@v1.0.0` or a
+full commit SHA.
+
 Start it advisory (`continue-on-error: true`). A red X on a model's opinion
 trains people to ignore the whole check. Promote it to required only once its
 precision has earned that.
+
+### GitHub only
+
+CodeRev reads the diff and posts its comment through the `gh` CLI, so it
+reviews GitHub pull requests only. A self-hosted runner works, Gitea's
+included, as long as the pull request lives on GitHub and the runner has `gh`.
+Gitea and Forgejo pull requests are not supported yet.
 
 ## Usage locally
 
@@ -99,14 +117,16 @@ the complete system and user prompts to stdin and read stdout as the model
 completion:
 
 ```yaml
-- uses: tsouth89/coderev@v1
+- uses: btsouth/coderev@v1
   with:
     provider: exec
     exec-command: grok
 ```
 
 The action's `grok` shorthand uses its bundled trusted wrapper to pass large
-prompts through a temporary file. CLI token usage is intentionally reported as unknown. Confirm that the
+prompts through a temporary file. The wrapper is Windows PowerShell, so the
+shorthand only works on Windows runners; elsewhere pass a full command. CLI
+token usage is intentionally reported as unknown. Confirm that the
 subscription terms permit automated pipeline use before enabling this. The
 same transport works for stage overlays through `find2-provider: exec` /
 `find2-exec-command` and `refute-provider: exec` /
@@ -151,6 +171,20 @@ never as a false positive, because it may be a real defect the baseline missed.
 See [fixtures/toolport-studio.json](fixtures/toolport-studio.json). Each case is
 a PR number, the baseline findings as `file`/`line`, and whether the PR received
 any commit after that review landed.
+
+## Security
+
+The model only ever sees text: with an HTTP provider it has no tools, so the
+worst a hostile PR can do is steer the comment it gets (and, if enabled, the
+Linear follow-ups it files). The exec provider is different. An agentic CLI with auto-approved tools reads the checkout, so only
+point it at code you trust, on a runner you would let that code touch.
+
+Keep the fork guard from the example: forks get no secrets, and a review of
+untrusted code should not hold your API key.
+
+Report vulnerabilities privately through GitHub's
+[security advisories](https://github.com/btsouth/coderev/security/advisories/new),
+not in a public issue.
 
 ## Development
 

@@ -61,6 +61,13 @@ before(async () => {
     let body = "";
     req.on("data", (chunk) => (body += String(chunk)));
     req.on("end", () => {
+      // Count only model calls. Local tooling can probe a fresh loopback port
+      // with a GET /, and counting that made the retry test fail on some
+      // machines.
+      if (req.method !== "POST" || req.url !== "/v1/chat/completions") {
+        res.writeHead(404).end();
+        return;
+      }
       behaviour.requestCount += 1;
       const failure = behaviour.failNext();
       if (failure !== null) {

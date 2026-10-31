@@ -5,6 +5,17 @@ import { describe, it } from "node:test";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 
+describe("action script hardening", () => {
+  it("never templates an expression into the shell script body", () => {
+    // ${{ }} inside run: is pasted into the script before bash parses it, so
+    // any input containing a quote becomes code. Inputs go through env.
+    const action = readFileSync(resolve(repoRoot, "action.yml"), "utf8");
+    const script = action.split(/^\s+run: \|$/m)[1] ?? "";
+    assert.notEqual(script, "");
+    assert.doesNotMatch(script, /\$\{\{/);
+  });
+});
+
 describe("Grok action wrapper invariants", () => {
   it("routes the grok preset through the trusted stdin wrapper", () => {
     const action = readFileSync(resolve(repoRoot, "action.yml"), "utf8");

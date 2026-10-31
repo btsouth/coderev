@@ -135,7 +135,7 @@ describe("parseBenchmarkSuite", () => {
     const suite = parseBenchmarkSuite(
       JSON.parse(await readFile(new URL("../fixtures/toolport-studio.json", import.meta.url), "utf8")),
     );
-    assert.equal(suite.repo, "tsouth89/toolport-studio");
+    assert.equal(suite.repo, "btsouth/toolport-studio");
     assert.equal(suite.cases.length, 10);
     // Four PRs merged with no follow-up commit; that distinction is the whole
     // reason actedOn exists, so a fixture that lost it would be silently wrong.
