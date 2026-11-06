@@ -22,6 +22,7 @@ import {
   type ResolvedReviewProvider,
   type TokenUsage,
 } from "./provider.ts";
+import { HIDDEN_TITLES, escapeHiddenCharacters } from "./hidden.ts";
 
 /**
  * Diffs are truncated rather than chunked.
@@ -970,10 +971,14 @@ export interface GroupedFinding {
 export function dedupeFindings(findings: ReadonlyArray<ReviewFinding>): Array<GroupedFinding> {
   const groups: Array<{ head: ReviewFinding; grouped: GroupedFinding }> = [];
   for (const finding of findings) {
+    // A model finding never joins a hidden-character group, however close
+    // its title: those groups are matched across passes by exact location.
     const existing = groups.find(
       (group) =>
-        jaccard(titleTokens(group.head.title), titleTokens(finding.title)) >=
-          DEDUPE_SIMILARITY_THRESHOLD || sameConcern(group.head, finding),
+        HIDDEN_TITLES.has(group.head.title) === HIDDEN_TITLES.has(finding.title) &&
+        (jaccard(titleTokens(group.head.title), titleTokens(finding.title)) >=
+          DEDUPE_SIMILARITY_THRESHOLD ||
+          sameConcern(group.head, finding)),
     );
     if (existing) {
       existing.grouped = {
@@ -1046,6 +1051,66 @@ export function classifyAgainstPrevious(
   changedLines?: ReadonlyMap<string, ReadonlySet<number>> | null,
 ): PassClassification {
   if (previous === null) return { fresh: grouped, carried: [], resolved: [] };
+  // Hidden-character findings are recomputed in full every pass, so their
+  // stored entries are matched by exact location and never carried on their
+  // own: a removed character drops out, a moved one is new, and a new site
+  // in a reported file is not absorbed by an old one with the same title.
+  const recomputedKey = (file: string, line: number, title: string) => `${title}\u0000${file}\u0000${line}`;
+  const reported = new Set(
+    previous
+      .filter((entry) => HIDDEN_TITLES.has(entry.title))
+      .map((entry) => recomputedKey(entry.file, entry.line, entry.title)),
+  );
+  const freshRecomputed = new Map<GroupedFinding, GroupedFinding>();
+  const carriedRecomputed: Array<PreviousFinding> = [];
+  for (const finding of grouped) {
+    if (!HIDDEN_TITLES.has(finding.title)) continue;
+    const isNew = (location: { readonly file: string; readonly line: number }) =>
+      !reported.has(recomputedKey(location.file, location.line, finding.title));
+    const newLocations = finding.locations.filter(isNew);
+    if (newLocations.length > 0) freshRecomputed.set(finding, { ...finding, locations: newLocations });
+    for (const location of finding.locations.filter((location) => !isNew(location))) {
+      carriedRecomputed.push({
+        file: location.file,
+        line: location.line,
+        title: finding.title,
+        severity: finding.severity,
+        ...(finding.confidence ? { confidence: finding.confidence } : {}),
+        ...(finding.disposition ? { disposition: finding.disposition } : {}),
+      });
+    }
+  }
+  const rest = classifyByTitle(
+    grouped.filter((finding) => !HIDDEN_TITLES.has(finding.title)),
+    previous.filter((entry) => !HIDDEN_TITLES.has(entry.title)),
+    changedLines,
+  );
+  // The caller sorted `grouped` by disposition and severity; keep that order
+  // rather than letting the split push a medium finding above a block.
+  const restFresh = new Set(rest.fresh);
+  const fresh = grouped.flatMap((finding) => {
+    const split = freshRecomputed.get(finding);
+    if (split) return [split];
+    return restFresh.has(finding) ? [finding] : [];
+  });
+  const rank = (entry: PreviousFinding) =>
+    (entry.disposition === undefined ? 4 : DISPOSITION_ORDER[entry.disposition]) * 10 +
+    SEVERITY_ORDER[entry.severity];
+  const carried =
+    carriedRecomputed.length === 0
+      ? rest.carried
+      : [...rest.carried, ...carriedRecomputed]
+          .map((entry, index) => ({ entry, index }))
+          .sort((a, b) => rank(a.entry) - rank(b.entry) || a.index - b.index)
+          .map(({ entry }) => entry);
+  return { fresh, carried, resolved: rest.resolved };
+}
+
+function classifyByTitle(
+  grouped: ReadonlyArray<GroupedFinding>,
+  previous: ReadonlyArray<PreviousFinding>,
+  changedLines?: ReadonlyMap<string, ReadonlySet<number>> | null,
+): PassClassification {
   const matchesEntry = (entry: PreviousFinding): boolean =>
     grouped.some((finding) =>
       finding.locations.some((location) =>
@@ -1179,9 +1244,10 @@ export function planInlineComments(
       .filter((location) => location !== spot)
       .map((location) => `\`${location.file}\`${location.line > 0 ? `:${location.line}` : ""}`);
     anchored.push({
+      // The real path, so the anchor matches the diff; only the text is escaped.
       path: spot.file,
       line: spot.line,
-      body: [
+      body: escapeHiddenCharacters([
         `**${finding.title}** \u00b7 ${formatFindingTags(finding)}`,
         ...(finding.detail.length > 0 ? ["", finding.detail] : []),
         ...(finding.fix
@@ -1197,7 +1263,7 @@ export function planInlineComments(
         ...(others.length > 0 ? ["", `Also applies to: ${others.join(", ")}`] : []),
         "",
         "<sub>CodeRev \u00b7 advisory</sub>",
-      ].join("\n"),
+      ].join("\n")),
     });
   }
   return { anchored, unanchored };
@@ -1221,6 +1287,8 @@ export function formatReviewComment(input: {
   readonly round?: number;
   /** Head-side changed lines of the reviewed diff, for evidence-based resolution. */
   readonly changedLines?: ReadonlyMap<string, ReadonlySet<number>> | null;
+  /** Why no model ran this pass, when only the deterministic checks did. */
+  readonly modelReviewSkipped?: string;
 }): string {
   const lines = [REVIEW_COMMENT_MARKER, "", "### Automated review", ""];
 
@@ -1338,12 +1406,17 @@ export function formatReviewComment(input: {
     input.panelModel && input.panelModel !== input.model
       ? `a ${REFUTATION_PANEL_SIZE}-vote \`${input.panelModel}\` refutation panel`
       : `a ${REFUTATION_PANEL_SIZE}-vote refutation panel`;
+  const deterministic = input.findings.some((finding) => HIDDEN_TITLES.has(finding.title));
   lines.push(
     "",
     "<sub>For coding agents: fix BLOCK and FIX IF QUICK findings now; everything " +
       "else is tracked or informational; never exceed one CodeRev fix round per PR.</sub>",
     "",
-    `<sub>Advisory. Findings generated by ${generators}, each filtered through ${panel} with the changed code in evidence.</sub>`,
+    input.modelReviewSkipped
+      ? `<sub>Advisory. The model review was skipped: ${input.modelReviewSkipped}. Only the deterministic hidden-character check ran.</sub>`
+      : `<sub>Advisory. Findings generated by ${generators}, each filtered through ${panel} with the changed code in evidence.` +
+          (deterministic ? " Hidden-character findings come from a deterministic check and skip the panel." : "") +
+          "</sub>",
     "",
     embedState(
       [
@@ -1364,7 +1437,9 @@ export function formatReviewComment(input: {
       input.round,
     ),
   );
-  return lines.join("\n");
+  // Nothing posted may carry a character the reader cannot see, whoever wrote
+  // the text: a file name from the diff, or a title the model produced.
+  return escapeHiddenCharacters(lines.join("\n"));
 }
 
 /** Lines of cited-file context handed to the panel around a finding's anchor. */
@@ -1916,6 +1991,12 @@ export interface DiffReviewResult {
  */
 export async function reviewDiff(input: {
   readonly diff: string;
+  /**
+   * Hidden-character findings from the diff as fetched (see src/hidden.ts).
+   * They go straight to the result: the panel reads the same diff, so
+   * injected text could otherwise argue them away.
+   */
+  readonly hiddenFindings?: ReadonlyArray<ReviewFinding>;
   readonly conventions: string | null;
   /** Full changed-file contents for the GENERATOR; measured to suppress candidate volume, so callers gate it behind --context. */
   readonly context?: string | null;
@@ -1951,6 +2032,11 @@ export async function reviewDiff(input: {
   readonly onProgress?: (message: string) => void;
 }): Promise<DiffReviewResult> {
   const note = input.onProgress ?? (() => {});
+
+  const hidden = input.hiddenFindings ?? [];
+  if (hidden.length > 0) {
+    note(`${hidden.length} line(s) or file name(s) carry hidden characters; reported without the panel.`);
+  }
 
   const findPrompt = buildFindPrompt({
     diff: input.diff,
@@ -2004,7 +2090,8 @@ export async function reviewDiff(input: {
     note(`Generation failed: ${generationError}`);
     return {
       candidates: [],
-      findings: [],
+      // Deterministic, so they stand without the model: a gate still sees them.
+      findings: [...hidden],
       adjudicated: [],
       usage: EMPTY_USAGE,
       findUsage: EMPTY_USAGE,
@@ -2142,7 +2229,10 @@ export async function reviewDiff(input: {
   );
   return {
     candidates,
-    findings: adjudicated.filter((entry) => entry.survived).map((entry) => entry.finding),
+    findings: [
+      ...hidden,
+      ...adjudicated.filter((entry) => entry.survived).map((entry) => entry.finding),
+    ],
     adjudicated,
     usage: addUsage(addUsage(found.usage, find2Usage), panelUsage),
     findUsage: found.usage,

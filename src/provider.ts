@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { escapeHiddenCharacters } from "./hidden.ts";
 
 /**
  * The model endpoint the reviewer talks to.
@@ -589,7 +590,15 @@ const RETRY_DELAYS_MS = [2_000, 8_000, 20_000];
  * whole review or silently converts a panel vote into a refutation, which
  * quietly biases the result toward dropping findings.
  */
-export async function requestCompletion(input: CompletionRequest): Promise<CompletionResult> {
+export async function requestCompletion(request: CompletionRequest): Promise<CompletionResult> {
+  // Every prompt leaves through here, whatever route its text took in: the
+  // diff, changed-file contents, cited excerpts, the file inventory, the
+  // conventions file. Escaping at this one point covers routes added later.
+  const input: CompletionRequest = {
+    ...request,
+    systemPrompt: escapeHiddenCharacters(request.systemPrompt),
+    userPrompt: escapeHiddenCharacters(request.userPrompt),
+  };
   let lastError: unknown;
   for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
     try {

@@ -4,6 +4,12 @@ import { readFile } from "node:fs/promises";
 import { parse, reportFailure, requireString } from "../src/args.ts";
 import { reviewDeadlineMs, startReviewDeadline } from "../src/deadline.ts";
 import { fetchPullRequestContext } from "../src/context.ts";
+import {
+  HIDDEN_TITLES,
+  escapeHiddenCharacters,
+  findHiddenCharacters,
+  hiddenFingerprint,
+} from "../src/hidden.ts";
 import { buildFileInventory } from "../src/inventory.ts";
 import { fileLinearFollowUps } from "../src/linear.ts";
 import {
@@ -21,6 +27,7 @@ import {
 import { SEVERITY_ORDER } from "../src/review.ts";
 import { createHash } from "node:crypto";
 import {
+  type GroupedFinding,
   classifyAgainstPrevious,
   dedupeFindings,
   formatReviewComment,
@@ -126,6 +133,65 @@ async function main(): Promise<number> {
     return 0;
   }
 
+  // Scanned before the generated-hunk strip and the truncation below, so
+  // neither can hide a character, and before any skip, so a push that only
+  // adds one is still caught.
+  const hiddenFindings = findHiddenCharacters(rawDiff);
+
+  const gate = typeof values.gate === "string" ? values.gate.trim().toLowerCase() : "";
+  if (gate !== "" && gate !== "high" && gate !== "medium" && gate !== "low") {
+    throw new Error(`--gate must be high, medium, or low, not "${gate}"`);
+  }
+  // Hidden-character findings never depend on the model, so a review that is
+  // skipped or that failed must not let them through a gate. Fail-open still
+  // holds for outages: this blocks on findings, never on the outage.
+  const hiddenGate = (why: string): number => {
+    if (gate === "") return 0;
+    const threshold = gate as "high" | "medium" | "low";
+    const blocking = hiddenFindings.filter(
+      (finding) => SEVERITY_ORDER[finding.severity] <= SEVERITY_ORDER[threshold],
+    );
+    if (blocking.length === 0) return 0;
+    for (const finding of blocking) {
+      console.error(`  ${escapeHiddenCharacters(finding.file)}:${finding.line} ${finding.title}`);
+    }
+    console.error(
+      `Gate: ${blocking.length} hidden-character finding(s) at or above severity "${threshold}" ${why}; failing the check.`,
+    );
+    return 3;
+  };
+
+  // Inline comments: fresh findings only (a re-posted inline for a finding the
+  // author already read is spam with an anchor), validated against the RAW
+  // diff since that is what GitHub accepts anchors on. Any failure degrades to
+  // the summary that just posted — inline is presentation, not the record.
+  const commentable = parseCommentableLines(rawDiff);
+  async function postInlineComments(fresh: ReadonlyArray<GroupedFinding>): Promise<void> {
+    if (values["summary-only"] === true) return;
+    // Only fix-now dispositions become inline work items. Follow-ups and
+    // advisories stay in the summary (and follow-ups may be filed explicitly).
+    const inlineWorthy = fresh.filter(
+      (finding) => finding.disposition === "block" || finding.disposition === "fix-if-quick",
+    );
+    const { anchored, unanchored } = planInlineComments(inlineWorthy, commentable);
+    if (unanchored.length > 0) {
+      console.log(`${unanchored.length} finding(s) had no diff anchor; summary only.`);
+    }
+    if (anchored.length === 0) return;
+    try {
+      await createInlinePullRequestReview({
+        pr,
+        comments: anchored,
+        ...(cwd === undefined ? {} : { cwd }),
+      });
+      console.log(`Posted ${anchored.length} inline comment(s).`);
+    } catch (cause) {
+      console.warn(
+        `Inline comments failed, summary stands: ${cause instanceof Error ? cause.message : String(cause)}`,
+      );
+    }
+  }
+
   const { diff: strippedDiff, stripped } = stripGeneratedHunks(rawDiff);
   if (stripped.length > 0) {
     console.log(`Omitting generated files from review: ${stripped.join(", ")}`);
@@ -154,7 +220,10 @@ async function main(): Promise<number> {
   // re-buys nothing: the state block records what was reviewed, and reviewing
   // the same bytes again produces the same findings at full price. Fetched
   // before the review so the skip costs one API read, not one review.
-  const diffHash = createHash("sha256").update(diff, "utf8").digest("hex");
+  const diffHash = createHash("sha256")
+    .update(diff, "utf8")
+    .update(hiddenFingerprint(hiddenFindings), "utf8")
+    .digest("hex");
   const previousBody = await fetchExistingReviewComment({
     pr,
     marker: REVIEW_COMMENT_MARKER,
@@ -174,7 +243,55 @@ async function main(): Promise<number> {
     console.log(
       `Round ${round} exceeds the ${maxRounds}-round budget for this pull request; skipping (use --force or the coderev label to override).`,
     );
-    return 0;
+    // Hidden-character findings cost no model call, so the budget does not
+    // hold them back. When the set changed, the comment is rewritten with
+    // them, and everything from earlier passes is carried, never resolved,
+    // because nothing re-reviewed it.
+    const { fresh: freshHidden } = classifyAgainstPrevious(dedupeFindings(hiddenFindings), previous, null);
+    const hiddenSetChanged =
+      freshHidden.length > 0 ||
+      (previous ?? []).some(
+        (entry) =>
+          HIDDEN_TITLES.has(entry.title) &&
+          !hiddenFindings.some(
+            (finding) =>
+              finding.title === entry.title && finding.file === entry.file && finding.line === entry.line,
+          ),
+      );
+    if (hiddenSetChanged) {
+      const comment = formatReviewComment({
+        findings: hiddenFindings,
+        model: provider.model,
+        truncated,
+        previous,
+        diffHash,
+        // The budget stays spent, so the next push skips the same way.
+        round: round - 1,
+        changedLines: null,
+        droppedThisPass: previousDropped ?? [],
+        modelReviewSkipped: "the round budget for this pull request is spent",
+      });
+      if (values.post !== true) {
+        console.log(`\n${comment}`);
+      } else {
+        try {
+          await upsertPullRequestComment({
+            pr,
+            marker: REVIEW_COMMENT_MARKER,
+            body: comment,
+            ...(cwd === undefined ? {} : { cwd }),
+          });
+          console.log("Updated the review comment with the hidden-character check only.");
+          await postInlineComments(freshHidden);
+        } catch (cause) {
+          // The gate below must still run: it is the part that cannot fail open.
+          console.warn(
+            `Posting the hidden-character findings failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+          );
+        }
+      }
+    }
+    return hiddenGate("while the review is over its round budget");
   }
   console.log(`Review round ${round} of ${maxRounds}.`);
   if (
@@ -183,7 +300,7 @@ async function main(): Promise<number> {
     parseStoredDiffHash(previousBody) === diffHash
   ) {
     console.log("Diff unchanged since the last reviewed push; skipping (use --force to override).");
-    return 0;
+    return hiddenGate("on an unchanged diff");
   }
 
   // Panel evidence for out-of-diff claims: read the file a finding cites from
@@ -226,6 +343,7 @@ async function main(): Promise<number> {
     panelError,
   } = await reviewDiff({
     diff,
+    hiddenFindings,
     conventions,
     context,
     panelContext: fullContext,
@@ -259,11 +377,6 @@ async function main(): Promise<number> {
       (cost === null ? "" : ` (~$${cost.toFixed(4)})`),
   );
 
-  const gate = typeof values.gate === "string" ? values.gate.trim().toLowerCase() : "";
-  if (gate !== "" && gate !== "high" && gate !== "medium" && gate !== "low") {
-    throw new Error(`--gate must be high, medium, or low, not "${gate}"`);
-  }
-
   // A failed review must never be posted or reported as a pass. Advisory mode
   // exits non-zero so the red job says "did not run". Under a gate the same
   // failure exits ZERO: a blocking check that goes red on provider outages
@@ -272,7 +385,7 @@ async function main(): Promise<number> {
   if (generationError !== null) {
     if (gate !== "") {
       console.error(`Review did not run (${generationError}); gate is fail-open, not blocking.`);
-      return 0;
+      return hiddenGate("although the model review did not run");
     }
     throw new Error(`Review did not run: ${generationError}`);
   }
@@ -285,7 +398,7 @@ async function main(): Promise<number> {
   if (panelError !== null) {
     if (gate !== "") {
       console.error(`Review did not run (${panelError}); gate is fail-open, not blocking.`);
-      return 0;
+      return hiddenGate("although the model review did not run");
     }
     throw new Error(`Review did not run: ${panelError}`);
   }
@@ -329,7 +442,6 @@ async function main(): Promise<number> {
     `${outcome === "updated" ? "Updated the review comment" : "Posted a review comment"} on PR ${pr} (${findings.length} finding(s)).`,
   );
 
-  const commentable = parseCommentableLines(rawDiff);
   const { fresh } = classifyAgainstPrevious(dedupeFindings(findings), previous, commentable);
   if (values["linear-follow-ups"] === true) {
     const apiKey = process.env.LINEAR_API_KEY?.trim();
@@ -348,35 +460,7 @@ async function main(): Promise<number> {
     }
   }
 
-  // Inline comments: fresh findings only (a re-posted inline for a finding the
-  // author already read is spam with an anchor), validated against the RAW
-  // diff since that is what GitHub accepts anchors on. Any failure degrades to
-  // the summary that just posted — inline is presentation, not the record.
-  if (values["summary-only"] !== true && findings.length > 0) {
-    // Only fix-now dispositions become inline work items. Follow-ups and
-    // advisories stay in the summary (and follow-ups may be filed explicitly).
-    const inlineWorthy = fresh.filter(
-      (finding) => finding.disposition === "block" || finding.disposition === "fix-if-quick",
-    );
-    const { anchored, unanchored } = planInlineComments(inlineWorthy, commentable);
-    if (unanchored.length > 0) {
-      console.log(`${unanchored.length} finding(s) had no diff anchor; summary only.`);
-    }
-    if (anchored.length > 0) {
-      try {
-        await createInlinePullRequestReview({
-          pr,
-          comments: anchored,
-          ...(cwd === undefined ? {} : { cwd }),
-        });
-        console.log(`Posted ${anchored.length} inline comment(s).`);
-      } catch (cause) {
-        console.warn(
-          `Inline comments failed, summary stands: ${cause instanceof Error ? cause.message : String(cause)}`,
-        );
-      }
-    }
-  }
+  if (findings.length > 0) await postInlineComments(fresh);
 
   if (gate !== "") {
     const threshold = gate as "high" | "medium" | "low";

@@ -15,6 +15,7 @@ import { resolve } from "node:path";
 import { after, before, describe, it } from "node:test";
 
 import { requestCompletion, type ResolvedReviewProvider } from "./provider.ts";
+import { HIDDEN_FINDING_TITLE, findHiddenCharacters } from "./hidden.ts";
 import { FIND_SYSTEM_PROMPT, reviewDiff } from "./review.ts";
 
 interface FakeBehaviour {
@@ -25,6 +26,8 @@ interface FakeBehaviour {
   /** Return an HTTP status to fail the next request with, or null to succeed. */
   failNext: () => number | null;
   requestCount: number;
+  /** Every model request body, in arrival order. */
+  bodies: Array<string>;
 }
 
 const behaviour: FakeBehaviour = {
@@ -32,6 +35,7 @@ const behaviour: FakeBehaviour = {
   refuteResponse: () => '{"refuted":false,"reason":"stands"}',
   failNext: () => null,
   requestCount: 0,
+  bodies: [],
 };
 
 let server: Server;
@@ -69,6 +73,7 @@ before(async () => {
         return;
       }
       behaviour.requestCount += 1;
+      behaviour.bodies.push(body);
       const failure = behaviour.failNext();
       if (failure !== null) {
         res.writeHead(failure, { "content-type": "application/json" });
@@ -94,6 +99,7 @@ function reset(): void {
   behaviour.refuteResponse = () => '{"refuted":false,"reason":"stands"}';
   behaviour.failNext = () => null;
   behaviour.requestCount = 0;
+  behaviour.bodies = [];
 }
 
 const DIFF = "--- a\n+++ b\n";
@@ -236,6 +242,95 @@ describe("pipeline against a streaming provider", () => {
   });
 });
 
+describe("hidden characters", () => {
+  const RLO = "\u202E";
+  const LRI = "\u2066";
+  const ZWSP = "\u200B";
+  const TAGS = "\u{E0069}\u{E0067}";
+  const HIDDEN =
+    /[\u00AD\u034F\u115F\u1160\u17B4\u17B5\u180B-\u180F\u2028\u2029\u3164\uFFA0\uFFF9-\uFFFB\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]|[\u{E0000}-\u{E007F}\u{E0100}-\u{E01EF}]/u;
+  const prompts = () =>
+    behaviour.bodies.map((body) =>
+      (JSON.parse(body) as { messages: Array<{ content: string }> }).messages
+        .map((message) => message.content)
+        .join("\n"),
+    );
+  const rawDiff = [
+    "diff --git a/a.ts b/a.ts",
+    "--- a/a.ts",
+    "+++ b/a.ts",
+    "@@ -1 +1,2 @@",
+    " one",
+    `+two ${RLO} ${TAGS}`,
+    "",
+  ].join("\n");
+
+  it("never sends one to the model, on any route", async () => {
+    reset();
+    behaviour.findResponse = JSON.stringify({
+      findings: [{ file: "a.ts", line: 2, title: "Something", detail: "d" }],
+    });
+    const result = await reviewDiff({
+      diff: rawDiff,
+      conventions: `Conventions ${RLO}`,
+      context: `--- a.ts ---\ngenerator context ${ZWSP}`,
+      panelContext: `--- a.ts ---\npanel context ${LRI}`,
+      inventory: `inventory ${RLO}`,
+      previousFindings: [{ file: "a.ts", line: 1, title: `old ${RLO}`, severity: "low" }],
+      previousDropped: [{ file: "a.ts", line: 1, title: `dropped ${ZWSP}`, severity: "low" }],
+      readCitedFile: async () => `one\ntwo ${RLO}\n`,
+      provider,
+    });
+    assert.equal(result.generationError, null);
+    const sent = prompts();
+    assert.ok(sent.length >= 3, "find plus at least two votes");
+    for (const prompt of sent) assert.doesNotMatch(prompt, HIDDEN);
+    // Escaped, not deleted: the model can still see that something was there,
+    // and the cited region keeps its line numbers.
+    assert.match(sent[0] ?? "", /\+two \[U\+202E\] \[2 hidden tag characters\]/);
+    assert.match(sent[0] ?? "", /Conventions \[U\+202E\]/);
+    assert.match(sent[1] ?? "", /panel context \[U\+2066\]/);
+    assert.match(sent[1] ?? "", /^2: two \[U\+202E\]$/m);
+  });
+
+  it("posts findings from the raw diff without putting them to the panel", async () => {
+    reset();
+    behaviour.findResponse = JSON.stringify({
+      findings: [{ file: "a.ts", line: 2, title: "Model claim", detail: "d" }],
+    });
+    // A panel that refutes everything: if the hidden-character finding were
+    // judged, injected text in the diff could argue it away.
+    behaviour.refuteResponse = () => '{"refuted":true,"reason":"the comment says to ignore this"}';
+    const result = await reviewDiff({
+      diff: "(stripped and truncated)",
+      hiddenFindings: findHiddenCharacters(rawDiff),
+      conventions: null,
+      provider,
+    });
+    assert.deepEqual(
+      result.findings.map((finding) => [finding.title, finding.file, finding.line]),
+      [[HIDDEN_FINDING_TITLE, "a.ts", 2]],
+    );
+    assert.equal(result.candidates.length, 1, "only the model's claim was a candidate");
+    for (const prompt of prompts()) assert.ok(!prompt.includes(HIDDEN_FINDING_TITLE));
+  });
+
+  it("still returns them when generation fails", async () => {
+    // They do not depend on the model, so an outage must not take them away
+    // from a gate.
+    reset();
+    behaviour.failNext = () => 400;
+    const result = await reviewDiff({
+      diff: "x",
+      hiddenFindings: findHiddenCharacters(rawDiff),
+      conventions: null,
+      provider,
+    });
+    assert.notEqual(result.generationError, null);
+    assert.deepEqual(result.findings.map((finding) => finding.title), [HIDDEN_FINDING_TITLE]);
+  });
+});
+
 describe("exec provider against a real child process", () => {
   it("writes both prompts to stdin and reads stdout as the completion", async () => {
     const result = await requestCompletion({
@@ -255,6 +350,19 @@ describe("exec provider against a real child process", () => {
       cachedInputTokens: 0,
       reported: false,
     });
+  });
+
+  it("escapes hidden characters on the way to a CLI's stdin", async () => {
+    const result = await requestCompletion({
+      provider: {
+        command: `"${process.execPath}" "${resolve("fixtures/fake-cli.mjs")}" --reject-hidden`,
+        model: "fake-cli",
+      },
+      systemPrompt: "SYSTEM SENTINEL",
+      userPrompt: "USER SENTINEL \u202E \u{E0069}",
+      temperature: 0,
+    });
+    assert.equal(result.content, '{"findings":[]}');
   });
 
   it("rides on the second generator when the agentic CLI blows its budget", async () => {
